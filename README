@@ -1,0 +1,28 @@
+XMLTV grabber for sledovanitv.cz
+================================
+
+
+Installation
+------------
+You need XMLTV, LWP, File::Slurp, Log::TraceMessages and JSON perl modules,
+which are not part of the default perl installation, but they will be
+probably installed as dependencies when you install XMLTV. If not install
+them manually from CPAN or your distribution package pool.
+
+Place tv_grab_cz_sledovanitv somewhere in your $PATH. Most XMLTV apps search
+$PATH for tv_grab_* programs when looking for grabbers. Be sure the file is
+executable.
+
+
+Configuration
+-------------
+Use any XMLTV GUI to configure the grabber. You can also use:
+  tv_grab_cz_sledovanitv --configure
+from the command line.
+
+
+Further information
+-------------------
+Run
+  tv_grab_cz_sledovanitv --help
+or read about grabbers on XMLTV wiki to get more information.

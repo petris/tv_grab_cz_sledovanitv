@@ -1,0 +1,540 @@
+#!/usr/bin/perl
+
+=pod
+
+=head1 NAME
+
+tv_grab_cz_sledovanitv - grab sledovanitv.cz listings
+
+=head1 SYNOPSIS
+
+tv_grab_cz_sledovanitv --help # Display usage information
+
+tv_grab_cz_sledovanitv --configure # Run the configuration wizard
+
+=head1 DESCRIPTION
+
+One needs an user account on sledovanitv.cz to use this grabber.
+
+Read about grabbers in generic XMLTV documentation to understand usage
+of a grabber. This grabber supports configure-api, thus it can be
+configured in various XMLTV GUIs or through the command line using
+the configure option.
+
+It's strongly recommended to enable the cache during the configuration
+if you plan to run the grabber more often then few times a day.
+
+=head1 SEE ALSO
+
+L<xmltv(5)>.
+
+=head1 COPYRIGHT
+
+Copyright (C) 2020 Petr Malat
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License version 2 as
+published by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see https://www.gnu.org/licenses/.
+
+=cut
+
+use warnings;
+use strict;
+use 5.010;
+
+use Log::TraceMessages qw(t);
+use List::Util qw(min max);
+use Encode qw(encode);
+use LWP::UserAgent;
+use Sys::Hostname;
+use File::Slurp;
+use DateTime;
+use JSON;
+use Carp;
+use URI;
+
+use XMLTV;
+use XMLTV::Options;
+use XMLTV::Configure::Writer;
+
+use constant NAME     => 'tv_grab_cz_sledovanitv';
+use constant TMFORMAT => '%Y%m%d%H%M%S %z';
+use constant PREAMBLE => ('generator-info-name' => NAME);
+use constant VERSION  => '0.1';
+
+my $debug = 0;
+
+# JSON RPC helper
+sub query_sledovanitv ($$) {
+	my $rpc = shift or carp;
+	my $args = shift or carp;
+
+	my $uri = URI->new('http://sledovanitv.cz/api/'.$rpc);
+	$uri->query_form(%{$args});
+
+	my $ua = new LWP::UserAgent(timeout => 60);
+	$ua->agent('XMLTV/' . VERSION);
+	if ($debug) {
+		$ua->add_handler("request_send",  sub { t shift->dump; return });
+		$ua->add_handler("response_done", sub { t shift->dump; return });
+	}
+	my $res = $ua->get($uri);
+
+	croak "Request failed: " . $res->status_line unless $res->is_success;
+	my $r = decode_json $res->decoded_content;
+	croak "Server returned error: " . $r->{error} if defined $r->{error};
+
+	t "Query '$rpc' suceeded";
+
+	return $r;
+}	
+
+# Log in in necessary and return PHP session ID 
+sub login($) {
+	my $c = shift or carp;
+	state $session = 0;
+
+	return $session if $session;
+
+	my $json = query_sledovanitv 'device-login', {
+		unit => 'default', deviceId => $c->{'device-id'}->[0],
+		password => $c->{'device-password'}->[0] };
+
+	croak "Missing session ID" unless defined $json->{PHPSESSID};
+	$session = $json->{PHPSESSID};
+
+	t "Logged on, session id $session";
+
+	return $session;
+}
+
+#
+# Program and channel listing
+#
+
+# Query sledovanitv.cz for programme data
+sub get_sledovanitv_schedule($$$$) {
+	my $c = shift or carp;
+	my $details = shift // carp;
+	my $start = shift or carp;
+	my $duration = shift // carp;
+
+	my $s = $start->clone;
+	$s->set_time_zone('Europe/Prague');
+
+	my $session = login $c;
+
+	t 'Fetching day ' . $start->ymd . " duration $duration";
+
+	my $json = query_sledovanitv 'epg', {
+			detail => $details, time => $s->strftime('%Y-%m-%d %H:%M'),
+			duration => $duration, PHPSESSID => $session };
+	return $json;
+}
+
+# Turn identificator into readable name. Useful to generate chanel names
+sub parse_name ($) {
+	$_ = shift // carp;
+	tr/_/ /;
+	s/^prima([A-Za-z])/Prima $1/;
+	s/([a-z])([A-Z])/$1 $2/g;
+	s/([\w']+)/\u$1/g;
+	return $_;
+}
+
+# Parse date format 'YYYY-MM-DD HH:MM' to DateTime
+sub parse_date ($) {
+	$_[0] =~ /^(\d{4})-(\d{1,2})-(\d{1,2}) (\d{1,2}):(\d{1,2})$/ or carp;
+	return DateTime->new(year => $1, month => $2, day => $3, hour => $4,
+			minute => $5, time_zone => 'Europe/Prague');
+}
+
+# Parse JSON into XMLTV data structure
+sub parse_sledovanitv_schedule ($$;$$$$) {
+	my $json = shift or carp;
+	my $populate_programme = shift // carp;
+	my $minstart;
+	my $enabled_channels;
+	my $ch;
+	my $pr;
+
+	if ($populate_programme) {
+		$minstart = shift // carp;
+		$ch = shift // carp;
+		$pr = shift // carp;
+		$enabled_channels = shift // carp;
+	} else {
+		($ch, $pr) = ({}, {});
+	}
+
+	while (my ($chid, $chp) = each %{$json->{channels}}) {
+		$ch->{$chid} = { 'id' => $chid, 'display-name' => [[parse_name $chid, 'cz']] };
+		if ($populate_programme) {
+			foreach my $p (@{$chp}) {
+				next unless defined $enabled_channels->{$chid};
+				my $start = parse_date $p->{startTime};
+				next if $start < $minstart;
+				my $end = parse_date $p->{endTime};
+				$pr->{$p->{eventId}} = {
+					channel => $chid,
+					title   => $p->{title},
+					desc    => $p->{description} ? $p->{description} : $p->{title},
+					start   => $start->strftime(TMFORMAT),
+					stop    => $end->strftime(TMFORMAT)};
+			}
+		}
+	}
+
+	return ($ch, $pr);
+}
+
+# Return XML with channels
+sub xmltv_list_channels ($$) {
+	my $json = get_sledovanitv_schedule $_[0], 0, DateTime->now, 60;
+	my ($ch, $pr) = parse_sledovanitv_schedule $json, 0;
+	my $rtn;
+	my $w = new XMLTV::Writer(OUTPUT => \$rtn, encoding => 'UTF-8');
+	$w->start({PREAMBLE});
+	$w->write_channels($ch);
+	$w->end();
+	return $rtn;
+}
+
+sub date_seq($$) {
+	my $d = shift or croak;
+	return map $d->clone()->add(days => $_), 0 .. -1 + $_[0];
+}
+
+# List programs. The first argument is offset the second is days.
+sub list_programs ($$$$) {
+	my $conf = shift // croak;
+	my $offset = shift // croak;
+	my $days = shift // croak;
+	my $cache = shift;
+	my $cache_update_start;
+	my $cache_update_end;
+	my $ch;
+	my $pr;
+
+	my %channels = map {$_ => 1} @{$conf->{channel}};
+	my $grab_start = DateTime->today()->add(days => $offset);
+	my @days = date_seq $grab_start, $days;
+
+	if (defined $cache) {
+		my $cache_start = DateTime->from_epoch(epoch => $cache->{start});
+		my $cache_end = DateTime->from_epoch(epoch => $cache->{end});
+		my $grab_end = $grab_start->clone()->add(days => $days);
+		my $gs = $grab_start->strftime(TMFORMAT),
+		my $ge = $grab_end->strftime(TMFORMAT);
+
+		t 'Cache covers ' . $cache_start->ymd . '..' . $cache_end->ymd .
+				' requested ' . $grab_start->ymd . '..' . $grab_end->ymd;
+
+		if ($cache_start == $grab_start && $cache_end <= $grab_end) {
+			# Fetch whole cache or extend to the future
+			$ch = $cache->{channels};
+			$pr = $cache->{programme};
+			my $dur = ($cache_end - $grab_start)->days();
+			t "Matched $dur out of $days days in fast cache";
+			@days = date_seq $cache_end, $days - $dur;
+			$cache_update_start = $cache_start;
+			$cache_update_end = $cache_end->add(days => $days - $dur);
+		} elsif ($cache_end > $grab_start && $cache_start < $grab_end) {
+			# Partial match
+			$pr = {};
+			while (my ($id, $prog) = each %{$cache->{programme}}) {
+				next if $prog->{stop} lt $gs;
+				next if $prog->{start} gt $ge;
+				$pr->{$id} = $prog;
+			}
+			$ch = $cache->{channels};
+			$cache_update_start = min($grab_start, $cache_start);
+			$cache_update_end = max($grab_end, $cache_end);
+			my $before = ($cache_start - $cache_update_start)->days();
+			my $after = ($cache_end - $cache_update_end)->days();
+			@days = date_seq($grab_start, $before),
+				date_seq($cache_end, $after);
+			t "Need to fetch $before days before cache starts and $after days after it ends";
+		} else {
+			# No match, replace cache
+			t "No match in cache, $days days will be fetched and cache replaced";
+			$cache->{programme} = {};
+			$pr = $cache->{programme};
+			$ch = {};
+			$cache_update_start = $grab_start;
+			$cache_update_end = $grab_end;
+		}
+	} else {
+		($ch, $pr) = ({}, {});
+	}
+
+	foreach my $d (@days) {
+		my $json = get_sledovanitv_schedule $conf, 1, $d, 1439;
+		my $prlen = keys %{$pr};
+		($ch, $pr) = parse_sledovanitv_schedule $json, 1, $d, $ch, $pr, \%channels;
+		if ($prlen == keys %{$pr}) {
+			t 'No data for ' . $d->ymd;
+			$cache_update_end = $d if $cache_update_end > $d; # Truncate cache to this day
+			last;
+		}
+	}
+
+	if (defined $cache) {
+		if ($cache->{programme} != $pr) {
+			t 'Updating slow cache';
+			while (my ($id, $prog) = each %{$pr}) {
+				$cache->{programme}->{$id} = $prog;
+			}
+		}
+		if (@days) {
+			t 'Updated cache, start on ' . $cache_update_start->ymd .
+		       			' end on ' . $cache_update_end->ymd;
+			$cache->{start} = $cache_update_start->epoch;
+			$cache->{end} = $cache_update_end->epoch;
+			$cache->{modified} = 1;
+		}
+	}
+
+
+	{ # XMLTV is extremelly verbose
+		local $Log::TraceMessages::On = 0;
+		my $w = new XMLTV::Writer(encoding => 'UTF-8');
+		$w->start({PREAMBLE});
+		$w->write_channels($ch);
+		foreach my $p (values %{$pr}) {
+			$w->write_programme({
+				channel => $p->{channel},
+				title   => [[encode('UTF-8', $p->{title}), 'cz']],
+				desc    => [[encode('UTF-8', $p->{desc}), 'cz']],
+				start   => $p->{start},
+				stop    => $p->{stop}});
+		}
+		$w->end();
+	}
+}
+
+#
+# XMLTV configuration capability
+#
+
+# Start configuration
+sub xmltv_stage_start ($) {
+	my $rtn;
+
+	my $w = new XMLTV::Configure::Writer(OUTPUT => \$rtn, encoding => 'utf-8');
+	$w->start({PREAMBLE});
+	$w->write_string({
+			id => 'user',
+			title => [['Username', 'en'],
+				  ['Uzivatelske jmeno', 'cz']],
+			description => [['User name or e-mail address to log on sledovanitv.cz', 'en'],
+				        ['Uzivatelske jmeno nebo e-mail pro zalogovani na sledovanitv.cz', 'cz']]});
+	$w->write_secretstring({
+			id => 'password',
+			title => [['Password', 'en'],
+				  ['Heslo', 'cz']],
+			description => [['Password to log on sledovanitv.cz', 'en'],
+				        ['Heslo pro zalogovani na sledovanitv.cz', 'cz']]});
+	$w->end('pair_device');
+	return $rtn;
+}
+
+# Pair device and ask for caching
+sub xmltv_stage_pair_device ($) {
+	my $c = shift or croak;
+	my $pass = $c->{password}[0] or croak; 
+	my $user = $c->{user}[0] or croak; 
+	my $host = hostname() // 'hobo';
+	my $id = read_file("/etc/machine-id", {err_mode=>'quite'}) // $host;
+	my $rtn;
+
+	# TODO: Delete user and password from the configuration file.
+	#       Seems there is no API for that
+	$c->{password} = [];
+	$c->{user} = [];
+
+	chomp $id;
+
+	# Pair the device
+	my $r = query_sledovanitv 'create-pairing', {
+		username => $user, password => $pass,
+		type => 'xbmc', product => $host, serial => $id };
+
+	# Store the token in the configuration file
+	my $xmltv_id = $r->{deviceId} or croak 'Missing device ID';
+	my $xmltv_pass = $r->{password} or croak 'Missing password';
+	my $w = new XMLTV::Configure::Writer(OUTPUT => \$rtn, encoding => 'utf-8');
+	$w->start({PREAMBLE});
+	$w->write_string({
+			id => 'device-id',
+			title => [['Device ID', 'en'],
+				  ['ID zarizeni', 'cz']],
+			description => [['Device ID assigned by sledovanitv.cz to this XMLTV instance', 'en'],
+				        ['ID zarizeni prirazene teto instanci XMLTV', 'cz']],
+			constant => $xmltv_id});
+	$w->write_string({
+			id => 'device-password',
+			title => [['Device password', 'en'],
+				  ['Heslo', 'cz']],
+			description => [['Password assigned by sledovanitv.cz to this XMLTV instance', 'en'],
+				        ['Heslo prirazene teto instanci XMLTV', 'cz']],
+			constant => $xmltv_pass});
+
+	# Ask if we should enable caching
+	$w->write_string({
+			id => 'cache',
+			title => [['Cache filename', 'en'],
+				  ['Soubor cache', 'cz']],
+			description => [['If filled in, this file will be used for caching ' .
+					 'sledovanitv.cz responses between grabber invocations.', 'en'],
+				        ['Soubor cache pro ukladani odpovedi sledovanitv.cz mezi ' .
+					 'jednotlivymi behy grabberu. Ponechte prazdne pro vypnti cache.', 'cz']],
+			 default => $ENV{HOME} . '/.xmltv/' . NAME . '.cache'});
+	$w->end('setup_cache');
+	return $rtn;
+}
+
+# Check if user wants to use cache and create it if yes
+sub xmltv_stage_setup_cache ($) {
+	my $c = shift or croak;
+	my $rtn;
+
+	my $w = new XMLTV::Configure::Writer(OUTPUT => \$rtn, encoding => 'utf-8');
+
+	if ($c->{cache}[0]) {
+		my $cache = $c->{cache}[0];
+		if (-f $cache) {
+			unlink $cache or croak("Can't delete '$cache': $!");
+		}
+		my $f;
+		open $f, '>', $cache or croak("Can't create '$cache': $!");
+		close $f or croak("Can't create '$cache': $!");
+	}
+
+	$w->write_string({
+			id => 'config-version',
+			title => [[NAME . ' version', 'en'],
+				  ['Verze ' . NAME, 'cz']],
+			description => [[NAME . ' version used to generate this file', 'en'],
+				        ['Verze ' . NAME . ', ktera vygenerovala tento soubor', 'cz']],
+			constant => VERSION});
+
+	$w->end('select-channels');
+	return $rtn;
+}
+
+# Dispatch the corect stage handler
+sub xmltv_stage ($$) {
+	my $stage = shift or croak;
+	my $conf = shift or croak;
+
+	return xmltv_stage_start $conf if $stage eq 'start';
+	return xmltv_stage_pair_device $conf if $stage eq 'pair_device';
+	return xmltv_stage_setup_cache $conf if $stage eq 'setup_cache';
+	croak "Unknown stage '$stage'";
+}
+
+#
+# Cache
+#
+
+# Load cache from file
+sub load_cache ($) {
+	my $fn = shift or croak;
+	my $json = read_file $fn, {err_mode=>'quite'};
+	my $today = DateTime->today();
+	my $empty = { start => $today->epoch, end => $today->epoch, created => time, programme => {}, channels => {} };
+
+	unless ($json) {
+		t "Failed to load cache from '$fn', starting with empty cache";
+		return $empty;
+	}
+
+	my $cache = decode_json $json;
+	unless ($cache) {
+		t "Failed to parse cache '$fn', starting with empty cache";
+		return $empty;
+	}
+
+	unless (defined $cache->{start} and defined $cache->{end} and defined $cache->{channels}
+			and defined $cache->{programme} and defined $cache->{created}) {
+		t "Invalid cache content in '$fn', starting with empty cache";
+		return $empty;
+	}
+
+	if (time - $cache->{created} > 60*60*50) {
+		t "Cache in '$fn' too old, starting with empty cache";
+		return $empty;
+	}
+
+	if ($cache->{start} < $today->epoch) { 
+		my $t = $today->strftime(TMFORMAT);
+		my $purged = 0;
+		while (my ($id, $prog) = each %{$cache->{programme}}) {
+			next if $prog->{stop} ge $today;
+			delete $cache->{programme}->{$id};
+			$purged++;
+		}
+		t "Using cache '$fn', purged $purged old entries";
+		$cache->{start} = $today->epoch;
+	} else {
+		t "Using cache '$fn'";
+	}
+
+	return $cache;
+}
+
+#
+# Main program
+#
+
+$Log::TraceMessages::On = 1 unless grep {$_ eq '--quiet'} @ARGV;
+$debug = 1 if grep {$_ eq '--debug'} @ARGV;
+
+my ($opt, $conf) = XMLTV::Options::ParseOptions({
+	grabber_name => NAME,
+	description => "Czechia (SledovaniTV.cz)",
+	version => VERSION,
+	capabilities => [qw/baseline manualconfig apiconfig cache/],
+	stage_sub => \&xmltv_stage,
+	listchannels_sub => \&xmltv_list_channels});
+
+
+# Handle days and offset
+my $offset = $opt->{offset} || 0;
+my $days = $opt->{days} || 2;
+warn "Offset too large" if $offset > 7;
+if ($days > 7) {
+	warn "Too many days";
+	$days = 7;
+}
+
+# Handle cache option
+my $cachefn;
+my $cache;
+if (defined $opt->{cache}) {
+	$cachefn = $opt->{cache};
+} elsif (defined $conf->{cache}) {
+	$cachefn = $conf->{cache}->[0];
+}
+$cache = load_cache $cachefn if defined $cachefn;
+
+# List programs
+list_programs $conf, $offset, $days, $cache;
+
+# Save cache
+if (defined $cache->{modified}) {
+	delete $cache->{modified};
+	write_file $cachefn, encode_json $cache;
+	t "Saved cache to $cachefn";
+}
+
+exit 0
