@@ -407,8 +407,6 @@ sub xmltv_stage_setup_cache ($) {
 	my $c = shift or croak;
 	my $rtn;
 
-	my $w = new XMLTV::Configure::Writer(OUTPUT => \$rtn, encoding => 'utf-8');
-
 	if ($c->{cache}[0]) {
 		my $cache = $c->{cache}[0];
 		if (-f $cache) {
@@ -418,7 +416,9 @@ sub xmltv_stage_setup_cache ($) {
 		open $f, '>', $cache or croak("Can't create '$cache': $!");
 		close $f or croak("Can't create '$cache': $!");
 	}
-
+	
+	my $w = new XMLTV::Configure::Writer(OUTPUT => \$rtn, encoding => 'utf-8');
+	$w->start({PREAMBLE});
 	$w->write_string({
 			id => 'config-version',
 			title => [[NAME . ' version', 'en'],
